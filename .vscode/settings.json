@@ -1,0 +1,32 @@
+{
+  "[go]": {
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "editor.insertSpaces": false,
+    "editor.tabSize": 4
+  },
+  "go.useLanguageServer": true,
+  "go.lintOnSave": "package",
+  "gopls": {
+    "ui.diagnostic.staticcheck": true,
+    "ui.completion.usePlaceholders": true
+  },
+  "cSpell.words": [
+    "Adminer",
+    "Bostan",
+    "Cobra",
+    "godoc",
+    "gofmt",
+    "goimports",
+    "GoReleaser",
+    "gopls",
+    "Laravel",
+    "ldflags",
+    "Mailpit",
+    "rezabagheri",
+    "WordPress",
+    "Yii"
+  ]
+}
