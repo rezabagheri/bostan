@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# pdev — Paradise Dev CLI
+# Manage local development environments
+set -euo pipefail
+
+# ─── Project root path ───────────────────────────────────────────────────────
+PDEV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PDEV_ROOT
+
+# ─── Load libraries ──────────────────────────────────────────────────────────
+source "${PDEV_ROOT}/lib/output.sh"
+source "${PDEV_ROOT}/lib/config.sh"
+source "${PDEV_ROOT}/lib/port.sh"
+source "${PDEV_ROOT}/lib/compose.sh"
+source "${PDEV_ROOT}/lib/hosts.sh"
+source "${PDEV_ROOT}/lib/db.sh"
+
+# ─── Load driver ─────────────────────────────────────────────────────────────
+load_driver() {
+  local type="$1"
+  local driver="${PDEV_ROOT}/drivers/${type}.sh"
+  [[ -f "$driver" ]] || fatal "Unknown site type: '${type}'. Available: wordpress, laravel, yii"
+  source "$driver"
+}
+
+# ─── VERSION ─────────────────────────────────────────────────────────────────
+PDEV_VERSION="0.1.0"
+
+# ─── USAGE ───────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+${BOLD}pdev${RESET} v${PDEV_VERSION} — Paradise Dev CLI
+
+${BOLD}USAGE${RESET}
+  pdev <command> <subcommand> [options]
+
+${BOLD}SITE COMMANDS${RESET}
+  pdev site add    --name <name> --type <type> [options]
+  pdev site up     <name>
+  pdev site down   <name>
+  pdev site delete <name> [--yes]
+  pdev site clone  <name> --as <new-name>
+  pdev site list
+  pdev site status
+
+${BOLD}DATABASE COMMANDS${RESET}
+  pdev db create  <site>
+  pdev db drop    <site> [--yes]
+  pdev db export  <site> [--output <file>]
+  pdev db import  <site> --file <file>
+
+${BOLD}PLUGIN COMMANDS${RESET}
+  pdev plugins sync   <site>
+  pdev plugins update <site>
+
+${BOLD}SETUP${RESET}
+  pdev setup        Initial project setup
+  pdev status       Status of all sites
+
+${BOLD}SITE ADD OPTIONS${RESET}
+  --name    <name>      Site name (required)
+  --type    <type>      Type: wordpress | laravel | yii (default: wordpress)
+  --port    <port>      Port (default: automatic)
+  --title   <title>     Site title
+  --locale  <locale>    Locale (default: en_US)
+  --admin-user    <u>   Admin username
+  --admin-pass    <p>   Admin password
+  --admin-email   <e>   Admin email
+  --dry-run             Show what would happen without executing
+EOF
+}
+
+# ─── SETUP ───────────────────────────────────────────────────────────────────
+cmd_setup() {
+  step "Setting up pdev..."
+
+  # Check Docker
+  command -v docker &>/dev/null || fatal "Docker not found. Install Docker first."
+  docker info &>/dev/null || fatal "Docker daemon is not running."
+
+  # Check Docker Compose
+  docker compose version &>/dev/null || fatal "Docker Compose v2 not found."
+
+  # Check python3
+  command -v python3 &>/dev/null || fatal "python3 not found."
+
+  success "All dependencies found"
+
+  # Start base services
+  step "Starting base services (db, proxy, mailhog, adminer)..."
+  docker compose -f "${PDEV_ROOT}/docker-compose.yml" up -d db proxy mailhog adminer
+
+  # Wait for DB to be ready
+  step "Waiting for database to be ready..."
+  local waited=0
+  until docker exec pdev-db mysqladmin ping -h localhost -prootpass --silent 2>/dev/null; do
+    sleep 2
+    (( waited += 2 ))
+    (( waited >= 60 )) && fatal "Database did not start in 60s"
+    echo -n "."
+  done
+  echo ""
+  success "Database is ready"
+
+  # Add base hosts
+  step "Adding base hosts to /etc/hosts..."
+  hosts_add "127.0.0.1" "adminer.test" "mail.test"
+
+  success "pdev setup complete!"
+  echo ""
+  info "Adminer  : http://adminer.test  (or http://localhost:8080)"
+  info "MailHog  : http://mail.test     (or http://localhost:8025)"
+  echo ""
+  dim "Now add your first site:"
+  dim "  pdev site add --name mysite --type wordpress"
+}
+
+# ─── SITE ADD ────────────────────────────────────────────────────────────────
+cmd_site_add() {
+  local name="" type="wordpress" port="" title="" locale="en_US"
+  local admin_user="admin" admin_pass="admin123" admin_email="admin@example.com"
+  local dry_run=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)         name="$2";        shift 2 ;;
+      --type)         type="$2";        shift 2 ;;
+      --port)         port="$2";        shift 2 ;;
+      --title)        title="$2";       shift 2 ;;
+      --locale)       locale="$2";      shift 2 ;;
+      --admin-user)   admin_user="$2";  shift 2 ;;
+      --admin-pass)   admin_pass="$2";  shift 2 ;;
+      --admin-email)  admin_email="$2"; shift 2 ;;
+      --dry-run)      dry_run=true;     shift ;;
+      *) fatal "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && fatal "--name is required"
+  # Only lowercase letters, numbers, and hyphens
+  [[ "$name" =~ ^[a-z0-9-]+$ ]] || fatal "Site name must be lowercase letters, numbers, and hyphens only"
+
+  site_exists "$name" && fatal "Site '${name}' already exists"
+
+  load_driver "$type"
+  [[ -z "$title" ]] && title="${name^} Site"
+  [[ -z "$port" ]] && port="$(find_free_port)"
+
+  local db_name="pdev_${name}"
+  local hostname="${name}.test"
+  local volume_name="${name}_data"
+
+  if $dry_run; then
+    echo ""
+    info "[DRY RUN] Would create site with:"
+    dim "  Name     : ${name}"
+    dim "  Type     : ${type}"
+    dim "  Domain   : http://${hostname}"
+    dim "  Port     : ${port}"
+    dim "  Database : ${db_name}"
+    dim "  Volume   : ${volume_name}"
+    echo ""
+    return 0
+  fi
+
+  step "Adding site '${name}' (${type}) on port ${port}..."
+
+  # Create config.json
+  config_create "$name" "$type" "$port"
+  config_set "$name" "wp.title"           "$title"
+  config_set "$name" "wp.admin_user"      "$admin_user"
+  config_set "$name" "wp.admin_password"  "$admin_pass"
+  config_set "$name" "wp.admin_email"     "$admin_email"
+  config_set "$name" "wp.locale"          "$locale"
+  success "Config created: sites/${name}/config.json"
+
+  # Get service YAML from driver
+  local service_yaml
+  service_yaml="$(driver_${type}_compose_service "$name" "$port" "$db_name" "$locale")"
+
+  # Add to compose
+  compose_add_service "$name" "$service_yaml" "$volume_name"
+  success "Service added to docker-compose.yml"
+
+  # Create database
+  db_check_running
+  db_create "$db_name"
+
+  # Add host entry
+  hosts_add "127.0.0.1" "$hostname"
+
+  # Start container
+  step "Starting container..."
+  compose_up "$name"
+
+  # Post-install (WordPress / Laravel / ...)
+  "driver_${type}_post_install" "$name"
+
+  echo ""
+  success "Site '${name}' is ready!"
+}

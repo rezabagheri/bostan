@@ -1,0 +1,6 @@
+{
+    "name": "paradisecyber",
+    "type": "wordpress",
+    "port": 8091,
+    "db_name": "pdev_paradisecyber"
+}

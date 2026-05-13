@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# pdev - Paradise Dev CLI
+# Local development environment manager
+set -uo pipefail
+
+PDEV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PDEV_ROOT
+
+source "${PDEV_ROOT}/lib/output.sh"
+source "${PDEV_ROOT}/lib/config.sh"
+source "${PDEV_ROOT}/lib/port.sh"
+source "${PDEV_ROOT}/lib/compose.sh"
+source "${PDEV_ROOT}/lib/hosts.sh"
+source "${PDEV_ROOT}/lib/db.sh"
+
+PDEV_VERSION="0.1.0"
+
+load_driver() {
+  local type="$1"
+  local driver="${PDEV_ROOT}/drivers/${type}.sh"
+  if [[ ! -f "$driver" ]]; then
+    fatal "Unknown site type: '${type}'. Available: wordpress, laravel, yii"
+  fi
+  source "$driver"
+}
+
+usage() {
+  cat <<EOF
+${BOLD}pdev${RESET} v${PDEV_VERSION} - Paradise Dev CLI
+
+${BOLD}USAGE${RESET}
+  pdev <command> <subcommand> [options]
+
+${BOLD}SITE COMMANDS${RESET}
+  pdev site add    --name <name> --type <type> [options]
+  pdev site up     <name>
+  pdev site down   <name>
+  pdev site delete <name> [--yes]
+  pdev site clone  <name> --as <new-name>
+  pdev site list
+  pdev site status
+
+${BOLD}DATABASE COMMANDS${RESET}
+  pdev db create  <site>
+  pdev db drop    <site> [--yes]
+  pdev db export  <site> [--output <file>]
+  pdev db import  <site> --file <file>
+
+${BOLD}PLUGIN COMMANDS${RESET}
+  pdev plugins sync   <site>
+  pdev plugins update <site>
+
+${BOLD}GENERAL${RESET}
+  pdev setup        First-time project setup
+  pdev status       Show all sites status
+
+${BOLD}SITE ADD OPTIONS${RESET}
+  --name    <name>      Site name, lowercase + hyphens (required)
+  --type    <type>      wordpress | laravel | yii  (default: wordpress)
+  --port    <port>      Port number (default: auto-assigned)
+  --title   <title>     Site title
+  --locale  <locale>    WordPress locale (default: en_US)
+  --admin-user  <u>     Admin username  (default: admin)
+  --admin-pass  <p>     Admin password  (default: admin123)
+  --admin-email <e>     Admin email
+  --dry-run             Preview changes without applying
+EOF
+}
+
+cmd_setup() {
+  step "Setting up pdev..."
+
+  command -v docker &>/dev/null || fatal "Docker not found. Please install Docker first."
+  docker info &>/dev/null       || fatal "Docker daemon is not running."
+  docker compose version &>/dev/null || fatal "Docker Compose v2 not found."
+  command -v python3 &>/dev/null || fatal "python3 not found."
+
+  success "All dependencies found"
+
+  step "Starting base services..."
+  docker compose -f "${PDEV_ROOT}/docker-compose.yml" up -d db proxy mailhog adminer
+
+  step "Waiting for database..."
+  local waited=0
+  until docker exec pdev-db mysqladmin ping -h localhost -prootpass --silent 2>/dev/null; do
+    sleep 2
+    (( waited += 2 )) || true
+    (( waited >= 60 )) && fatal "Database did not start in 60s"
+    printf "."
+  done
+  echo ""
+  success "Database is ready"
+
+  step "Adding base hosts..."
+  hosts_add "127.0.0.1" "adminer.test" "mail.test"
+
+  echo ""
+  success "Setup complete!"
+  info "Adminer : http://adminer.test  (also http://localhost:8080)"
+  info "MailHog : http://mail.test     (also http://localhost:8025)"
+  dim  "Add your first site: pdev site add --name mysite --type wordpress"
+}
+
+cmd_site_add() {
+  local name="" type="wordpress" port="" title="" locale="en_US"
+  local admin_user="admin" admin_pass="admin123" admin_email="admin@example.com"
+  local dry_run=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)         name="$2";        shift 2 ;;
+      --type)         type="$2";        shift 2 ;;
+      --port)         port="$2";        shift 2 ;;
+      --title)        title="$2";       shift 2 ;;
+      --locale)       locale="$2";      shift 2 ;;
+      --admin-user)   admin_user="$2";  shift 2 ;;
+      --admin-pass)   admin_pass="$2";  shift 2 ;;
+      --admin-email)  admin_email="$2"; shift 2 ;;
+      --dry-run)      dry_run=true;     shift ;;
+      *) fatal "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && fatal "--name is required"
+  [[ "$name" =~ ^[a-z0-9-]+$ ]] || fatal "Site name must be lowercase letters, numbers, and hyphens only"
+  site_exists "$name" && fatal "Site '${name}' already exists"
+
+  load_driver "$type"
+
+  [[ -z "$title" ]] && title="${name^} Site"
+  [[ -z "$port" ]]  && port="$(find_free_port)"
+
+  local db_name="pdev_${name}"
+  local hostname="${name}.test"
+  local volume_name="${name}_data"
+
+  if $dry_run; then
+    echo ""
+    info "[DRY RUN] Would create:"
+    dim "  Name     : ${name}"
+    dim "  Type     : ${type}"
+    dim "  Domain   : http://${hostname}"
+    dim "  Port     : ${port}"
+    dim "  Database : ${db_name}"
+    echo ""
+    return 0
+  fi
+
+  step "Adding site '${name}' [${type}] on port ${port}..."
+
+  config_create "$name" "$type" "$port"
+  config_set "$name" "wp.title"          "$title"
+  config_set "$name" "wp.admin_user"     "$admin_user"
+  config_set "$name" "wp.admin_password" "$admin_pass"
+  config_set "$name" "wp.admin_email"    "$admin_email"
+  config_set "$name" "wp.locale"         "$locale"
+  success "Config created: sites/${name}/config.json"
+
+  local service_yaml
+  service_yaml="$(driver_${type}_compose_service "$name" "$port" "$db_name" "$locale")"
+  compose_add_service "$name" "$service_yaml" "$volume_name"
+  success "Service added to docker-compose.yml"
+
+  db_check_running
+  db_create "$db_name"
+
+  hosts_add "127.0.0.1" "$hostname"
+
+  step "Starting container..."
+  compose_up "$name"
+
+  "driver_${type}_post_install" "$name"
+
+  echo ""
+  success "Site '${name}' is ready!"
+}
+
+cmd_site_up() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && fatal "Usage: pdev site up <name>"
+  site_exists "$name" || fatal "Site '${name}' not found"
+  step "Starting '${name}'..."
+  compose_up "$name"
+  success "Site '${name}' is up"
+}
+
+cmd_site_down() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && fatal "Usage: pdev site down <name>"
+  site_exists "$name" || fatal "Site '${name}' not found"
+  step "Stopping '${name}'..."
+  compose_down "$name"
+  success "Site '${name}' is stopped"
+}
+
+cmd_site_delete() {
+  local name="${1:-}"
+  local force=false
+  [[ -z "$name" ]] && fatal "Usage: pdev site delete <name> [--yes]"
+  [[ "${2:-}" == "--yes" ]] && force=true
+
+  site_exists "$name" || fatal "Site '${name}' not found"
+
+  if ! $force; then
+    confirm "Delete site '${name}'? This removes the container, database, and config." \
+      || { info "Cancelled"; return 0; }
+  fi
+
+  local db_name; db_name="$(config_get "$name" "db.name")"
+  local volume_name="${name}_data"
+
+  step "Stopping and removing container..."
+  compose_rm "$name"
+  step "Removing from docker-compose.yml..."
+  compose_remove_service "$name" "$volume_name"
+  step "Dropping database..."
+  db_drop "$db_name"
+  step "Removing /etc/hosts entry..."
+  hosts_remove "${name}.test"
+  step "Removing config..."
+  rm -rf "${PDEV_ROOT}/sites/${name}"
+
+  success "Site '${name}' deleted"
+}
+
+cmd_site_clone() {
+  local src="${1:-}"
+  local dst=""
+  shift || true
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --as) dst="$2"; shift 2 ;;
+      *) fatal "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -z "$src" ]] && fatal "Usage: pdev site clone <name> --as <new-name>"
+  [[ -z "$dst" ]] && fatal "--as <new-name> is required"
+  site_exists "$src"  || fatal "Source site '${src}' not found"
+  site_exists "$dst" && fatal "Destination '${dst}' already exists"
+
+  local type;   type="$(config_get "$src" "type")"
+  local port;   port="$(find_free_port)"
+  local db_dst="pdev_${dst}"
+  local locale; locale="$(config_get "$src" "wp.locale")"
+
+  load_driver "$type"
+  step "Cloning '${src}' -> '${dst}'..."
+
+  config_create "$dst" "$type" "$port"
+  config_set "$dst" "wp.title"          "$(config_get "$src" "wp.title") (clone)"
+  config_set "$dst" "wp.admin_user"     "$(config_get "$src" "wp.admin_user")"
+  config_set "$dst" "wp.admin_password" "$(config_get "$src" "wp.admin_password")"
+  config_set "$dst" "wp.admin_email"    "$(config_get "$src" "wp.admin_email")"
+  config_set "$dst" "wp.locale"         "$locale"
+
+  local service_yaml
+  service_yaml="$(driver_${type}_compose_service "$dst" "$port" "$db_dst" "$locale")"
+  compose_add_service "$dst" "$service_yaml" "${dst}_data"
+
+  db_check_running
+  db_create "$db_dst"
+  db_clone "$src" "$dst"
+  hosts_add "127.0.0.1" "${dst}.test"
+  compose_up "$dst"
+
+  success "Cloned '${src}' -> '${dst}'"
+  info "URL: http://${dst}.test"
+}
+
+cmd_site_list() {
+  local sites=()
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && sites+=("$s")
+  done < <(config_list_sites)
+
+  if [[ ${#sites[@]} -eq 0 ]]; then
+    info "No sites found. Add one with: pdev site add --name mysite"
+    return 0
+  fi
+
+  print_table_header
+  for name in "${sites[@]}"; do
+    local type port status
+    type="$(config_get "$name" "type" 2>/dev/null || echo "unknown")"
+    port="$(config_get "$name" "port" 2>/dev/null || echo "-")"
+    status="$(compose_status "$name")"
+    print_table_row "$name" "$type" "http://${name}.test" "$status" "$port"
+  done
+}
+
+cmd_site_status() { cmd_site_list; }
+
+cmd_db() {
+  local subcmd="${1:-}"
+  shift || true
+
+  case "$subcmd" in
+    create)
+      local name="${1:-}"; [[ -z "$name" ]] && fatal "Usage: pdev db create <site>"
+      site_exists "$name" || fatal "Site '${name}' not found"
+      db_check_running && db_create "$(config_get "$name" "db.name")"
+      ;;
+    drop)
+      local name="${1:-}"; [[ -z "$name" ]] && fatal "Usage: pdev db drop <site>"
+      site_exists "$name" || fatal "Site '${name}' not found"
+      local db_name; db_name="$(config_get "$name" "db.name")"
+      if [[ "${2:-}" != "--yes" ]]; then
+        confirm "Drop database '${db_name}'?" || { info "Cancelled"; return 0; }
+      fi
+      db_check_running && db_drop "$db_name"
+      ;;
+    export)
+      local name="${1:-}"; [[ -z "$name" ]] && fatal "Usage: pdev db export <site> [--output <file>]"
+      site_exists "$name" || fatal "Site '${name}' not found"
+      local output=""
+      [[ "${2:-}" == "--output" ]] && output="${3:-}"
+      db_check_running && db_export "$name" "$output"
+      ;;
+    import)
+      local name="${1:-}"; [[ -z "$name" ]] && fatal "Usage: pdev db import <site> --file <file>"
+      [[ "${2:-}" == "--file" ]] || fatal "--file <path> is required"
+      local file="${3:-}"; [[ -z "$file" ]] && fatal "--file value is empty"
+      site_exists "$name" || fatal "Site '${name}' not found"
+      db_check_running && db_import "$name" "$file"
+      ;;
+    *)
+      fatal "Unknown db subcommand: '${subcmd}'. Available: create | drop | export | import"
+      ;;
+  esac
+}
+
+cmd_plugins() {
+  local subcmd="${1:-}"
+  shift || true
+  local name="${1:-}"; [[ -z "$name" ]] && fatal "Usage: pdev plugins <sync|update> <site>"
+  site_exists "$name" || fatal "Site '${name}' not found"
+  local type; type="$(config_get "$name" "type")"
+  load_driver "$type"
+
+  case "$subcmd" in
+    sync)
+      step "Syncing plugins for '${name}'..."
+      local plugins_json; plugins_json="$(config_get "$name" "plugins")"
+      if [[ "$plugins_json" == "[]" || -z "$plugins_json" ]]; then
+        info "No plugins configured for '${name}'"
+        return 0
+      fi
+      while IFS= read -r plugin_url; do
+        docker compose -f "${PDEV_ROOT}/docker-compose.yml" \
+          exec -T "$name" bash -c "wp plugin install '${plugin_url}' --activate --allow-root" \
+          && success "Installed: ${plugin_url}" \
+          || warn "Failed: ${plugin_url}"
+      done < <(echo "$plugins_json" | python3 -c "import sys,json; [print(p) for p in json.load(sys.stdin)]")
+      ;;
+    update)
+      step "Updating all plugins for '${name}'..."
+      docker compose -f "${PDEV_ROOT}/docker-compose.yml" \
+        exec -T "$name" bash -c "wp plugin update --all --allow-root"
+      success "Plugins updated"
+      ;;
+    *)
+      fatal "Unknown plugins subcommand: '${subcmd}'. Available: sync | update"
+      ;;
+  esac
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  local cmd="$1"; shift
+
+  case "$cmd" in
+    setup)   cmd_setup ;;
+    status)  cmd_site_status ;;
+
+    site)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        add)    cmd_site_add    "$@" ;;
+        up)     cmd_site_up     "$@" ;;
+        down)   cmd_site_down   "$@" ;;
+        delete) cmd_site_delete "$@" ;;
+        clone)  cmd_site_clone  "$@" ;;
+        list)   cmd_site_list ;;
+        status) cmd_site_status ;;
+        "")     fatal "Missing subcommand. Run: pdev --help" ;;
+        *)      fatal "Unknown site subcommand: '${sub}'" ;;
+      esac
+      ;;
+
+    db)      cmd_db      "$@" ;;
+    plugins) cmd_plugins "$@" ;;
+
+    -h|--help|help) usage ;;
+    -v|--version)   echo "pdev v${PDEV_VERSION}" ;;
+    *)              fatal "Unknown command: '${cmd}'. Run: pdev --help" ;;
+  esac
+}
+
+main "$@"

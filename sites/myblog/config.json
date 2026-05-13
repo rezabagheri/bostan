@@ -1,0 +1,18 @@
+{
+  "site_name": "myblog",
+  "type": "wordpress",
+  "db": {
+    "engine": "mysql",
+    "name": "pdev_myblog"
+  },
+  "port": 8090,
+  "wp": {
+    "title": "Myblog Site",
+    "admin_user": "admin",
+    "admin_password": "admin123",
+    "admin_email": "admin@example.com",
+    "locale": "en_US"
+  },
+  "plugins": [],
+  "settings": {}
+}
